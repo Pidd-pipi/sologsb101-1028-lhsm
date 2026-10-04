@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
+  Alert,
   Button,
   Card,
   Col,
@@ -24,14 +25,27 @@ import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import TakeBadge from '@/components/common/TakeBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import RevisionConflictAlert, { type RevisionConflictField } from '@/components/common/RevisionConflictAlert';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { usePickStore } from '@/stores/pickStore';
-import { db, type PickRow, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import {
+  db,
+  isRevisionConflict,
+  type PickRow,
+  type ProjectRow,
+  type SessionRow,
+  type SongRow,
+  type TakeRow
+} from '@/utils/db';
 import { PICK_USAGES, createEmptyPick, type Pick } from '@/types/pick';
 import type { FilterModel, FilterSelectConfig } from '@/types/filter';
+import { isPickBasisFresh } from '@/utils/pickBasis';
 import { buildEditList, formatDuration, takeDuration, totalDuration } from '@/utils/timecode';
 
 const asArray = (value: string | string[] | boolean | undefined): string[] => (Array.isArray(value) ? value : []);
+
+/** 优选表单字段（confirmState / basis 由保存动作自动维护） */
+type PickFormValues = Omit<Pick, 'id' | 'order' | 'confirmState' | 'basis'>;
 
 export default function PickSummary() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -46,6 +60,7 @@ export default function PickSummary() {
   const resetFilters = usePickStore((state) => state.resetFilters);
   const createPick = usePickStore((state) => state.createPick);
   const editPick = usePickStore((state) => state.editPick);
+  const confirmPick = usePickStore((state) => state.confirmPick);
   const deletePick = usePickStore((state) => state.deletePick);
   const move = usePickStore((state) => state.move);
 
@@ -53,7 +68,10 @@ export default function PickSummary() {
   const [editing, setEditing] = useState<PickRow | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
-  const [form] = Form.useForm<Omit<Pick, 'id' | 'order'>>();
+  /** 打开编辑弹窗时读到的已读版本，保存前与库内版本比对 */
+  const [baseRevision, setBaseRevision] = useState(0);
+  const [conflict, setConflict] = useState<PickRow | null>(null);
+  const [form] = Form.useForm<PickFormValues>();
 
   useEffect(() => {
     setFilters({
@@ -73,6 +91,24 @@ export default function PickSummary() {
   }
 
   const takeOf = (takeId: string): TakeRow | null => takes.find((item) => item.id === takeId) ?? null;
+  const sessionOf = (sessionId: string): SessionRow | undefined => sessions.find((item) => item.id === sessionId);
+
+  /** 优选是否仍有效：状态已确认且确认基准与当前 Take 时间码 / 棚号一致（双保险） */
+  const isPickActive = (pick: PickRow): boolean => {
+    if (pick.confirmState !== '已确认') return false;
+    const take = takeOf(pick.takeId);
+    const session = take ? sessionOf(take.sessionId) : undefined;
+    if (!take || !session) return false;
+    return isPickBasisFresh(pick, { startTc: take.startTc, endTc: take.endTc, roomNo: session.roomNo });
+  };
+
+  /** 待复核：状态标记待复核，或基准已与现值不符（历史数据 / 跨端写入兜底） */
+  const pendingPicks = useMemo(() => picks.filter((pick) => !isPickActive(pick)), [picks, takes, sessions]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+
+  /** 已确认优选（剪接清单只认这些） */
+  const confirmedPicks = useMemo(() => picks.filter((pick) => isPickActive(pick)), [picks, takes, sessions]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 
   const sessionLabel = (sessionId: string): string => {
     const session = sessions.find((item) => item.id === sessionId);
@@ -82,10 +118,11 @@ export default function PickSummary() {
     return `${song ? song.title : '未知曲目'}${project ? ` · ${project.name}` : ''} · ${session.date} ${session.period}`;
   };
 
+  /** 已确认清单上的用途 / 关键字筛选；待复核区不受筛选影响，保证不被漏掉 */
   const filtered = useMemo(() => {
     const keyword = String(filters.keyword ?? '').trim().toLowerCase();
     const usages = asArray(filters.usages);
-    return picks
+    return confirmedPicks
       .filter((pick) => {
         const take = takeOf(pick.takeId);
         const label = `${pick.usage} ${pick.note} ${take ? take.takeNo : ''}`.toLowerCase();
@@ -95,7 +132,7 @@ export default function PickSummary() {
       })
       .sort((a, b) => a.order - b.order);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [picks, takes, filters]);
+  }, [confirmedPicks, takes, filters]);
 
   const editList = useMemo(
     () =>
@@ -110,32 +147,108 @@ export default function PickSummary() {
   const totals = useMemo(() => {
     const usable = takes.filter((take) => take.grade === '可用').length;
     return {
-      pickCount: picks.length,
+      pickCount: confirmedPicks.length,
+      pendingCount: pendingPicks.length,
       usableTakeCount: usable,
-      pickRatio: usable > 0 ? Math.round((picks.length / usable) * 100) : 0,
+      pickRatio: usable > 0 ? Math.round((confirmedPicks.length / usable) * 100) : 0,
       durationText: formatDuration(totalDuration(editList)),
-      usageCount: new Set(picks.map((item) => item.usage)).size
+      usageCount: new Set(confirmedPicks.map((item) => item.usage)).size
     };
-  }, [picks, takes, editList]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [confirmedPicks, pendingPicks, takes, editList]);
 
-  /** 只有「可用」评级且尚未被优选的条次可作为候选 */
+  /** 只有「可用」评级且尚未被优选（含待复核）的条次可作为候选 */
   const candidates = useMemo(
     () => takes.filter((take) => take.grade === '可用' && !picks.some((pick) => pick.takeId === take.id)),
     [takes, picks]
   );
 
+  /** 打开编辑弹窗：记录已读版本，清掉旧冲突 */
+  function openEdit(pick: PickRow): void {
+    setEditing(pick);
+    setBaseRevision(pick.revision);
+    setConflict(null);
+    form.setFieldsValue({ takeId: pick.takeId, usage: pick.usage, note: pick.note });
+    setDialogOpen(true);
+  }
+
+  function openCreate(): void {
+    setEditing(null);
+    setConflict(null);
+    setBaseRevision(0);
+    form.setFieldsValue({ ...createEmptyPick(), takeId: candidates[0]?.id ?? '' });
+    setDialogOpen(true);
+  }
+
+  /** 构造修订冲突的逐字段对比（保留输入 vs 库内最新值） */
+  function buildConflictFields(latest: PickRow): RevisionConflictField<keyof PickFormValues>[] {
+    const input = form.getFieldsValue(true);
+    const fields: Array<[keyof PickFormValues, string]> = [
+      ['takeId', '条次'],
+      ['usage', '用途'],
+      ['note', '备注']
+    ];
+    return fields
+      .filter(([field]) => String(input[field] ?? '') !== String(latest[field]))
+      .map(([field, label]) => ({
+        fieldName: field,
+        label,
+        inputValue: field === 'takeId' ? takeLabel(String(input[field] ?? '')) : String(input[field] ?? ''),
+        latestValue: field === 'takeId' ? takeLabel(String(latest[field])) : String(latest[field])
+      }));
+  }
+
+  function takeLabel(takeId: string): string {
+    const take = takeOf(takeId);
+    return take ? `${take.takeNo} · ${take.startTc} → ${take.endTc}` : takeId;
+  }
+
+  /** 冲突解决：采用库内最新值（可逐字段或全部），并以最新版本为新的已读版本 */
+  function adoptConflict(
+    values: Partial<Record<keyof PickFormValues, string | number>>,
+    latestRevision: number
+  ): void {
+    form.setFieldsValue(values as Partial<PickFormValues>);
+    setBaseRevision(latestRevision);
+    setConflict(null);
+  }
+
   async function submit(): Promise<void> {
     const values = await form.validateFields();
-    if (editing) {
-      await editPick(editing.id, values);
-      message.success('优选记录已更新');
-    } else {
-      await createPick(values);
-      message.success('已加入剪接清单');
+    try {
+      if (editing) {
+        await editPick(editing.id, values, baseRevision);
+        message.success('优选记录已更新');
+      } else {
+        await createPick(values);
+        message.success('已加入剪接清单');
+      }
+      setDialogOpen(false);
+      setEditing(null);
+      setConflict(null);
+      form.resetFields();
+    } catch (submitError) {
+      if (isRevisionConflict(submitError)) {
+        setConflict(submitError.latest as PickRow);
+        return;
+      }
+      const text = submitError instanceof Error ? submitError.message : '保存失败';
+      message.error(text);
     }
-    setDialogOpen(false);
-    setEditing(null);
-    form.resetFields();
+  }
+
+  /** 复核确认：以当前时间码 / 棚号重算基准，确认后才进入剪接清单 */
+  async function handleConfirm(pick: PickRow): Promise<void> {
+    try {
+      await confirmPick(pick.id, pick.revision);
+      message.success('已确认，优选重新进入剪接清单');
+    } catch (error) {
+      if (isRevisionConflict(error)) {
+        message.warning('该优选刚被其他页面改动，请刷新后重新复核');
+        return;
+      }
+      message.error(error instanceof Error ? error.message : '确认失败');
+    }
   }
 
   async function handleDrop(index: number): Promise<void> {
@@ -147,6 +260,85 @@ export default function PickSummary() {
     message.success('剪接顺序已更新并写回本地库');
   }
 
+  /** 待复核卡片：展示确认时基准与现值的差异 */
+  function renderPendingCard(): JSX.Element {
+    return (
+      <Card
+        title={
+          <Space>
+            <Tag color="orange">待复核区（{pendingPicks.length}）</Tag>
+            <span className="muted">Take 时间码或棚号变更后自动转入，确认前不进入剪接清单</span>
+          </Space>
+        }
+        style={{ marginBottom: 16, borderColor: '#f0c36d' }}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          {pendingPicks.map((pick) => {
+            const take = takeOf(pick.takeId);
+            const session = take ? sessionOf(take.sessionId) : undefined;
+            const basisParts = pick.basis.split(/→|@/);
+            const fresh =
+              take && session
+                ? isPickBasisFresh(pick, { startTc: take.startTc, endTc: take.endTc, roomNo: session.roomNo })
+                : false;
+            return (
+              <Card key={pick.id} size="small" style={{ background: '#fffbe6' }}>
+                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                  <Space wrap>
+                    <Tag color="orange">待复核</Tag>
+                    <Tag color="blue">{pick.usage}</Tag>
+                    <Typography.Text strong>{take ? take.takeNo : '条次已删除'}</Typography.Text>
+                    <Typography.Text type="secondary">顺序 #{pick.order}</Typography.Text>
+                  </Space>
+                  <Space size={20} wrap>
+                    <div>
+                      <div className="muted">确认时基准</div>
+                      <div>
+                        {basisParts.length === 3
+                          ? `${basisParts[0]} → ${basisParts[1]} · ${basisParts[2]}`
+                          : '—'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="muted">当前值</div>
+                      <div>
+                        {take && session
+                          ? `${take.startTc} → ${take.endTc} · ${session.roomNo}`
+                          : '条次或场次已删除'}
+                      </div>
+                    </div>
+                  </Space>
+                  {take && session && !fresh ? (
+                    <Typography.Text type="warning">基准已变化，请核对当前时间码与棚号后再确认。</Typography.Text>
+                  ) : null}
+                  <Space>
+                    <Button type="primary" size="small" disabled={!take || !session} onClick={() => void handleConfirm(pick)}>
+                      核对无误，确认
+                    </Button>
+                    <Button size="small" onClick={() => openEdit(pick)}>
+                      编辑
+                    </Button>
+                    <Popconfirm
+                      title="移出剪接清单？"
+                      onConfirm={async () => {
+                        await deletePick(pick.id);
+                        message.success('已移出剪接清单');
+                      }}
+                    >
+                      <Button size="small" type="link" danger>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  </Space>
+                </Space>
+              </Card>
+            );
+          })}
+        </Space>
+      </Card>
+    );
+  }
+
   const selects: FilterSelectConfig[] = [
     { key: 'usages', label: '用途', options: PICK_USAGES.map((item) => ({ label: item, value: item })) }
   ];
@@ -156,24 +348,18 @@ export default function PickSummary() {
       <div className="page__head">
         <div>
           <h2 className="page__title">优选 Take 汇总与剪接清单</h2>
-          <p className="page__subtitle">从「可用」评级的条次中挑选，拖拽卡片或用上下移按钮调整剪接顺序。</p>
+          <p className="page__subtitle">
+            从「可用」评级的条次中挑选，拖拽卡片或用上下移按钮调整剪接顺序。Take 时间码 / 棚号变更后，关联优选转入待复核区，确认前不进入剪接清单。
+          </p>
         </div>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          disabled={candidates.length === 0}
-          onClick={() => {
-            setEditing(null);
-            form.setFieldsValue({ ...createEmptyPick(), takeId: candidates[0]?.id ?? '' });
-            setDialogOpen(true);
-          }}
-        >
+        <Button type="primary" icon={<PlusOutlined />} disabled={candidates.length === 0} onClick={openCreate}>
           加入优选
         </Button>
       </div>
 
       <div className="badge-row">
-        <StatBadge label="优选条次" value={totals.pickCount} suffix="条" tone="primary" icon="files" />
+        <StatBadge label="已确认优选" value={totals.pickCount} suffix="条" tone="primary" icon="files" />
+        <StatBadge label="待复核" value={totals.pendingCount} suffix="条" tone="warning" icon="warning" />
         <StatBadge label="可用 Take" value={totals.usableTakeCount} suffix="条" tone="success" icon="grid" />
         <StatBadge label="优选覆盖率" value={totals.pickRatio} percent={totals.pickRatio} showPercent tone="warning" icon="pie" />
         <StatBadge label="剪接总时长" value={totals.durationText} tone="info" icon="histogram" />
@@ -192,17 +378,15 @@ export default function PickSummary() {
         extra={<Tag color="blue">候选可用 Take {candidates.length} 条</Tag>}
       />
 
-      {filtered.length === 0 ? (
+      {pendingPicks.length > 0 ? renderPendingCard() : null}
+
+      {pendingPicks.length === 0 && filtered.length === 0 ? (
         <EmptyPanel
           title="剪接清单还是空的"
           description="从可用评级的 Take 中挑选片段，组成主歌 / 副歌 / 独奏的剪接清单。"
           showCreate={candidates.length > 0}
           createText="加入优选"
-          onCreate={() => {
-            setEditing(null);
-            form.setFieldsValue({ ...createEmptyPick(), takeId: candidates[0]?.id ?? '' });
-            setDialogOpen(true);
-          }}
+          onCreate={openCreate}
         />
       ) : (
         <Row gutter={16}>
@@ -247,15 +431,7 @@ export default function PickSummary() {
                         >
                           下移
                         </Button>
-                        <Button
-                          size="small"
-                          type="link"
-                          onClick={() => {
-                            setEditing(pick);
-                            form.setFieldsValue({ takeId: pick.takeId, usage: pick.usage, note: pick.note });
-                            setDialogOpen(true);
-                          }}
-                        >
+                        <Button size="small" type="link" onClick={() => openEdit(pick)}>
                           编辑
                         </Button>
                         <Popconfirm
@@ -287,7 +463,7 @@ export default function PickSummary() {
             </Space>
           </Col>
           <Col xs={24} xl={9}>
-            <Card title="剪接清单（自动生成）">
+            <Card title="剪接清单（自动生成，仅含已确认优选）">
               {editList.length === 0 ? (
                 <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可拼接的片段" />
               ) : (
@@ -320,14 +496,21 @@ export default function PickSummary() {
         </Row>
       )}
 
-      <Card title="优选明细表">
+      <Card title="优选明细表" style={{ marginTop: 16 }}>
         <Table<PickRow>
           rowKey="id"
-          dataSource={[...filtered].sort((a, b) => a.order - b.order)}
+          dataSource={[...picks].sort((a, b) => a.order - b.order)}
           pagination={false}
           locale={{ emptyText: '暂无优选记录' }}
           columns={[
             { title: '顺序', dataIndex: 'order', width: 80 },
+            {
+              title: '确认状态',
+              dataIndex: 'confirmState',
+              width: 100,
+              render: (_, row) =>
+                isPickActive(row) ? <Tag color="green">已确认</Tag> : <Tag color="orange">待复核</Tag>
+            },
             { title: '用途', dataIndex: 'usage', width: 100 },
             {
               title: '条次',
@@ -345,6 +528,20 @@ export default function PickSummary() {
                 const take = takeOf(row.takeId);
                 return take ? formatDuration(takeDuration(take.startTc, take.endTc)) : '—';
               }
+            },
+            {
+              title: '操作',
+              width: 110,
+              render: (_, row) =>
+                isPickActive(row) ? (
+                  <Button size="small" type="link" onClick={() => openEdit(row)}>
+                    编辑
+                  </Button>
+                ) : (
+                  <Button size="small" type="primary" onClick={() => void handleConfirm(row)}>
+                    复核确认
+                  </Button>
+                )
             }
           ]}
         />
@@ -359,6 +556,13 @@ export default function PickSummary() {
         cancelText="取消"
         destroyOnClose
       >
+        {conflict ? (
+          <RevisionConflictAlert<keyof PickFormValues>
+            fields={buildConflictFields(conflict)}
+            latestRevision={conflict.revision}
+            onAdopt={adoptConflict}
+          />
+        ) : null}
         <Form form={form} layout="vertical">
           <Form.Item name="takeId" label="条次" rules={[{ required: true, message: '请选择条次' }]}>
             <Select
@@ -378,6 +582,14 @@ export default function PickSummary() {
           <Form.Item name="note" label="备注">
             <Input.TextArea rows={2} placeholder="如：鼓组干净，可作主歌第一段" />
           </Form.Item>
+          {editing ? (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginTop: -4 }}
+              message="换选条次保存后将以新条次当前时间码 / 棚号作为确认基准，直接进入剪接清单。"
+            />
+          ) : null}
         </Form>
       </Modal>
     </div>

@@ -22,11 +22,12 @@ import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import TakeBadge from '@/components/common/TakeBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import RevisionConflictAlert, { type RevisionConflictField } from '@/components/common/RevisionConflictAlert';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useTakeFilter } from '@/hooks/useTakeFilter';
 import { useTakeStore } from '@/stores/takeStore';
 import { useSessionStore } from '@/stores/sessionStore';
-import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import { db, isRevisionConflict, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
 import { TAKE_GRADES, TAKE_ISSUES, createEmptyTake, type Take, type TakeGrade } from '@/types/take';
 import type { FilterSelectConfig } from '@/types/filter';
 import {
@@ -62,6 +63,9 @@ export default function TakeBoard() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<TakeRow | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 打开编辑弹窗时读到的已读版本，保存前与库内版本比对 */
+  const [baseRevision, setBaseRevision] = useState(0);
+  const [conflict, setConflict] = useState<TakeRow | null>(null);
   const [form] = Form.useForm<Omit<Take, 'id'>>();
 
   useEffect(() => {
@@ -158,19 +162,7 @@ export default function TakeBoard() {
           <Button
             type="link"
             size="small"
-            onClick={() => {
-              setEditing(row);
-              setError(null);
-              form.setFieldsValue({
-                sessionId: row.sessionId,
-                takeNo: row.takeNo,
-                startTc: row.startTc,
-                endTc: row.endTc,
-                grade: row.grade,
-                issues: row.issues
-              });
-              setDialogOpen(true);
-            }}
+            onClick={() => openEdit(row)}
           >
             编辑
           </Button>
@@ -190,6 +182,54 @@ export default function TakeBoard() {
       )
     }
   ];
+
+  /** 打开编辑弹窗：记录已读版本，清掉旧冲突 */
+  function openEdit(row: TakeRow): void {
+    setEditing(row);
+    setBaseRevision(row.revision);
+    setConflict(null);
+    setError(null);
+    form.setFieldsValue({
+      sessionId: row.sessionId,
+      takeNo: row.takeNo,
+      startTc: row.startTc,
+      endTc: row.endTc,
+      grade: row.grade,
+      issues: row.issues
+    });
+    setDialogOpen(true);
+  }
+
+  /** 构造修订冲突的逐字段对比（保留输入 vs 库内最新值） */
+  function buildConflictFields(latest: TakeRow): RevisionConflictField<keyof Omit<Take, 'id'>>[] {
+    const input = form.getFieldsValue(true);
+    const fields: Array<[keyof Omit<Take, 'id'>, string]> = [
+      ['sessionId', '场次'],
+      ['takeNo', 'Take 号'],
+      ['startTc', '起始时间码'],
+      ['endTc', '结束时间码'],
+      ['grade', '评级']
+    ];
+    const plain = (value: string | string[]): string => (Array.isArray(value) ? value.join('、') : value);
+    return fields
+      .filter(([field]) => plain(input[field] ?? '') !== plain((latest as Take)[field] as string | string[]))
+      .map(([field, label]) => ({
+        fieldName: field,
+        label,
+        inputValue: plain(input[field] ?? ''),
+        latestValue: plain((latest as Take)[field] as string | string[])
+      }));
+  }
+
+  /** 冲突解决：采用库内最新值（可逐字段或全部），并以最新版本为新的已读版本 */
+  function adoptConflict(
+    values: Partial<Record<keyof Omit<Take, 'id'>, string | number>>,
+    latestRevision: number
+  ): void {
+    form.setFieldsValue(values as Partial<Omit<Take, 'id'>>);
+    setBaseRevision(latestRevision);
+    setConflict(null);
+  }
 
   async function submit(): Promise<void> {
     const values = await form.validateFields();
@@ -211,8 +251,22 @@ export default function TakeBoard() {
     const clash = siblings.find((take) => isOverlapping(values.startTc, values.endTc, take.startTc, take.endTc));
     setError(null);
     if (editing) {
-      await editTake(editing.id, values);
-      message.success('条次已更新');
+      try {
+        const outcome = await editTake(editing.id, values, baseRevision);
+        message.success('条次已更新');
+        if (outcome.invalidatedPicks > 0) {
+          message.warning(`时间码 / 场次已变更：${outcome.invalidatedPicks} 条关联优选转入待复核，确认前不进入剪接清单`);
+        }
+      } catch (submitError) {
+        if (isRevisionConflict(submitError)) {
+          setConflict(submitError.latest as TakeRow);
+          return;
+        }
+        const text = submitError instanceof Error ? submitError.message : '保存失败';
+        setError(text);
+        message.error(text);
+        return;
+      }
     } else {
       await createTake(values);
       message.success('条次已标记');
@@ -222,6 +276,7 @@ export default function TakeBoard() {
     }
     setDialogOpen(false);
     setEditing(null);
+    setConflict(null);
     form.resetFields();
   }
 
@@ -230,6 +285,8 @@ export default function TakeBoard() {
     const targetSessionId = currentSessionId ?? sessions[0]?.id ?? '';
     const siblings = takes.filter((take) => take.sessionId === targetSessionId);
     setEditing(null);
+    setConflict(null);
+    setBaseRevision(0);
     setError(null);
     form.setFieldsValue({
       ...createEmptyTake(),
@@ -344,6 +401,13 @@ export default function TakeBoard() {
         cancelText="取消"
         destroyOnClose
       >
+        {conflict ? (
+          <RevisionConflictAlert<keyof Omit<Take, 'id'>>
+            fields={buildConflictFields(conflict)}
+            latestRevision={conflict.revision}
+            onAdopt={adoptConflict}
+          />
+        ) : null}
         {error ? <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} /> : null}
         <Form form={form} layout="vertical">
           <Form.Item name="sessionId" label="场次" rules={[{ required: true, message: '请选择场次' }]}>

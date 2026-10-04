@@ -17,6 +17,7 @@ import type {
   RetakeRow
 } from './db';
 import { ROW_REVISION } from './revision';
+import { pickBasisSignature } from './pickBasis';
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
   const now = Date.now();
@@ -52,7 +53,7 @@ const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
   { id: 'tk-006', sessionId: 'ss-004', takeNo: 'T01', startTc: '00:00:08:00', endTc: '00:03:45:00', grade: '可用', issues: ['无'] }
 ];
 
-const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt' | 'confirmState' | 'basis'>> = [
   { id: 'pk-001', takeId: 'tk-001', usage: '主歌', order: 1, note: '第 1 段最稳，鼓组干净' },
   { id: 'pk-002', takeId: 'tk-004', usage: '副歌', order: 2, note: '弦乐起弓整齐' },
   { id: 'pk-003', takeId: 'tk-006', usage: '全曲', order: 3, note: '钢琴整轨留作参考' }
@@ -65,6 +66,19 @@ const RETAKES: Array<Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = 
 
 /** 灌入演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录）；目标库由调用方传入，避免反向 import */
 export async function seedDatabase(target: GbStudioTakeDatabase): Promise<void> {
+  // 优选确认基准 = Take 起止时间码 + 场次棚号；播种数据默认全部已确认
+  const takeById = new Map(TAKES.map((item) => [item.id, item]));
+  const roomBySession = new Map(SESSIONS.map((item) => [item.id, item.roomNo]));
+  const picksWithBasis: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = PICKS.map((pick) => {
+    const take = takeById.get(pick.takeId);
+    const roomNo = take ? roomBySession.get(take.sessionId) ?? '' : '';
+    return {
+      ...pick,
+      confirmState: '已确认',
+      basis: take ? pickBasisSignature({ startTc: take.startTc, endTc: take.endTc, roomNo }) : ''
+    };
+  });
+
   await target.transaction(
     'rw',
     [target.projects, target.songs, target.sessions, target.takes, target.picks, target.retakes],
@@ -73,7 +87,7 @@ export async function seedDatabase(target: GbStudioTakeDatabase): Promise<void> 
       await target.songs.bulkPut(SONGS.map(rev));
       await target.sessions.bulkPut(SESSIONS.map(rev));
       await target.takes.bulkPut(TAKES.map(rev));
-      await target.picks.bulkPut(PICKS.map(rev));
+      await target.picks.bulkPut(picksWithBasis.map(rev));
       await target.retakes.bulkPut(RETAKES.map(rev));
     }
   );

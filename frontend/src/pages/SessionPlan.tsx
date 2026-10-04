@@ -19,10 +19,18 @@ import { PlusOutlined } from '@ant-design/icons';
 import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import RevisionConflictAlert, { type RevisionConflictField } from '@/components/common/RevisionConflictAlert';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import {
+  db,
+  isRevisionConflict,
+  type ProjectRow,
+  type SessionRow,
+  type SongRow,
+  type TakeRow
+} from '@/utils/db';
 import {
   SESSION_PERIODS,
   SESSION_STATES,
@@ -55,6 +63,9 @@ export default function SessionPlan() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRow | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 打开编辑弹窗时读到的已读版本，保存前与库内版本比对 */
+  const [baseRevision, setBaseRevision] = useState(0);
+  const [conflict, setConflict] = useState<SessionRow | null>(null);
   const [form] = Form.useForm<Omit<Session, 'id'>>();
 
   useEffect(() => {
@@ -144,21 +155,79 @@ export default function SessionPlan() {
     };
   }, [scopedSessions, takes]);
 
+  /** 打开编辑弹窗：记录已读版本，清掉旧冲突 */
+  function openEdit(row: SessionRow): void {
+    setEditing(row);
+    setBaseRevision(row.revision);
+    setConflict(null);
+    setError(null);
+    form.setFieldsValue({
+      songId: row.songId,
+      date: row.date,
+      period: row.period,
+      engineer: row.engineer,
+      roomNo: row.roomNo,
+      musicians: row.musicians,
+      state: row.state
+    });
+    setDialogOpen(true);
+  }
+
+  /** 构造修订冲突的逐字段对比（保留输入 vs 库内最新值） */
+  function buildConflictFields(latest: SessionRow): RevisionConflictField<keyof Omit<Session, 'id'>>[] {
+    const input = form.getFieldsValue(true);
+    const fields: Array<[keyof Omit<Session, 'id'>, string]> = [
+      ['songId', '曲目'],
+      ['date', '日期'],
+      ['period', '时段'],
+      ['roomNo', '棚号'],
+      ['engineer', '录音师'],
+      ['musicians', '参与乐手'],
+      ['state', '状态']
+    ];
+    return fields
+      .filter(([field]) => String(input[field] ?? '') !== String(latest[field]))
+      .map(([field, label]) => ({
+        fieldName: field,
+        label,
+        inputValue: String(input[field] ?? ''),
+        latestValue: String(latest[field])
+      }));
+  }
+
+  /** 冲突解决：采用库内最新值（可逐字段或全部），并以最新版本为新的已读版本 */
+  function adoptConflict(
+    values: Partial<Record<keyof Omit<Session, 'id'>, string | number>>,
+    latestRevision: number
+  ): void {
+    form.setFieldsValue(values as Partial<Omit<Session, 'id'>>);
+    setBaseRevision(latestRevision);
+    setConflict(null);
+  }
+
   async function submit(): Promise<void> {
     const values = await form.validateFields();
     setError(null);
     try {
       if (editing) {
-        await editSession(editing.id, values);
+        const outcome = await editSession(editing.id, values, baseRevision);
         message.success('场次已更新');
+        if (outcome.invalidatedPicks > 0) {
+          message.warning(`棚号已变更：${outcome.invalidatedPicks} 条关联优选转入待复核，确认前不进入剪接清单`);
+        }
       } else {
         await createSession(values);
         message.success('场次已排期');
       }
       setDialogOpen(false);
       setEditing(null);
+      setConflict(null);
       form.resetFields();
     } catch (submitError) {
+      if (isRevisionConflict(submitError)) {
+        setConflict(submitError.latest as SessionRow);
+        return;
+      }
       const text = submitError instanceof Error ? submitError.message : '保存失败';
       setError(text);
       message.error(text);
@@ -178,7 +247,9 @@ export default function SessionPlan() {
           disabled={songs.length === 0}
           onClick={() => {
             setEditing(null);
+            setConflict(null);
             setError(null);
+            setBaseRevision(0);
             form.setFieldsValue({
               ...createEmptySession(),
               songId: songs.find((song) => song.projectId === currentProjectId)?.id ?? songs[0]?.id ?? ''
@@ -228,6 +299,8 @@ export default function SessionPlan() {
           showCreate={songs.length > 0}
           onCreate={() => {
             setEditing(null);
+            setConflict(null);
+            setBaseRevision(0);
             form.setFieldsValue(createEmptySession());
             setDialogOpen(true);
           }}
@@ -277,20 +350,7 @@ export default function SessionPlan() {
                     <Button
                       type="link"
                       size="small"
-                      onClick={() => {
-                        setEditing(row);
-                        setError(null);
-                        form.setFieldsValue({
-                          songId: row.songId,
-                          date: row.date,
-                          period: row.period,
-                          engineer: row.engineer,
-                          roomNo: row.roomNo,
-                          musicians: row.musicians,
-                          state: row.state
-                        });
-                        setDialogOpen(true);
-                      }}
+                      onClick={() => openEdit(row)}
                     >
                       编辑
                     </Button>
@@ -323,6 +383,14 @@ export default function SessionPlan() {
         cancelText="取消"
         destroyOnClose
       >
+        {conflict ? (
+          <RevisionConflictAlert<keyof Omit<Session, 'id'>>
+            fields={buildConflictFields(conflict)}
+            latestRevision={conflict.revision}
+            onAdopt={adoptConflict}
+          />
+        ) : null}
+        {error ? <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} /> : null}
         <Form form={form} layout="vertical">
           <Form.Item name="songId" label="曲目" rules={[{ required: true, message: '请选择曲目' }]}>
             <Select

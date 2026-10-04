@@ -1,25 +1,28 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbstudiotake-db，数据结构版本号 version(1) 与 upgrade() 迁移逻辑
+ * - 数据库名 gbstudiotake-db，数据结构版本号 version(2) 与 upgrade() 迁移逻辑
  * - 项目 / 曲目 / 场次 / Take / 优选 / 补录 六张表分表存储
  * - 首次打开自动播种互相引用的演示数据，保证每个页面打开都有内容
+ * - 场次 / Take / 优选采用乐观锁修订保存：保存前比对已读 revision，
+ *   落后即抛 RevisionConflictError 且不写入；Take 时间码或棚号变动时关联优选立即失效
  */
 import Dexie, { type Table } from 'dexie';
 import type { Project } from '../types/project';
 import type { Song } from '../types/song';
 import type { Session } from '../types/session';
 import type { Take } from '../types/take';
-import type { Pick } from '../types/pick';
+import type { Pick, PickConfirmState } from '../types/pick';
 import type { Retake } from '../types/retake';
 import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 import { ROW_REVISION } from './revision';
+import { pickBasisSignature } from './pickBasis';
 
 /** 数据库名 */
 export const DB_NAME = 'gbstudiotake-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号（定义在叶子模块 ./revision，避免与 ./seed 形成循环依赖） */
 export { ROW_REVISION };
@@ -37,6 +40,27 @@ export type TakeRow = Take & Revisioned;
 export type PickRow = Pick & Revisioned;
 export type RetakeRow = Retake & Revisioned;
 
+/** 保存结果：返回本次受影响（转入待复核）的优选条数 */
+export interface SaveOutcome {
+  invalidatedPicks: number;
+}
+
+/**
+ * 修订冲突：已读版本落后于库内最新版本（多标签同时编辑）。
+ * 调用方捕获后保留用户输入、并列展示冲突，由用户决定采用最新值还是放弃，不会写入新版本。
+ */
+export class RevisionConflictError extends Error {
+  readonly kind = 'revision-conflict' as const;
+  constructor(readonly latest: Revisioned) {
+    super('数据已被其他页面修改（版本落后），请核对冲突后再保存');
+    this.name = 'RevisionConflictError';
+  }
+}
+
+export function isRevisionConflict(error: unknown): error is RevisionConflictError {
+  return error instanceof RevisionConflictError;
+}
+
 export class GbStudioTakeDatabase extends Dexie {
   projects!: Table<ProjectRow, string>;
   songs!: Table<SongRow, string>;
@@ -48,28 +72,59 @@ export class GbStudioTakeDatabase extends Dexie {
   constructor() {
     super(DB_NAME);
 
+    // v1：初版六表结构
+    this.version(1).stores({
+      projects: 'id, name, client, state, startDate, updatedAt',
+      songs: 'id, projectId, title, arrangement, state, updatedAt',
+      sessions: 'id, songId, date, period, roomNo, engineer, state, updatedAt',
+      takes: 'id, sessionId, takeNo, grade, startTc, updatedAt',
+      picks: 'id, takeId, usage, order, updatedAt',
+      retakes: 'id, songId, planDate, state, updatedAt'
+    });
+
+    // v2：优选增加确认状态；场次 / Take / 优选启用乐观锁编辑版本
     this.version(DB_SCHEMA_VERSION)
       .stores({
         projects: 'id, name, client, state, startDate, updatedAt',
         songs: 'id, projectId, title, arrangement, state, updatedAt',
         sessions: 'id, songId, date, period, roomNo, engineer, state, updatedAt',
         takes: 'id, sessionId, takeNo, grade, startTc, updatedAt',
-        picks: 'id, takeId, usage, order, updatedAt',
+        picks: 'id, takeId, usage, order, confirmState, updatedAt',
         retakes: 'id, songId, planDate, state, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 结构迁移：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
+        // 结构迁移：为历史行补齐编辑版本号与时间戳；新建库时各表为空，迁移天然幂等
         const tableNames = ['projects', 'songs', 'sessions', 'takes', 'picks', 'retakes'];
         for (const name of tableNames) {
           await tx
             .table(name)
             .toCollection()
             .modify((row: Record<string, unknown>) => {
-              row.revision = ROW_REVISION;
+              if (typeof row.revision !== 'number') row.revision = ROW_REVISION;
               if (typeof row.createdAt !== 'number') row.createdAt = Date.now();
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
             });
         }
+
+        // 旧优选补确认状态与确认基准，全部进入待复核区（确认前不进剪接清单）
+        const takeRows = await tx.table<{ id: string; sessionId: string; startTc: string; endTc: string }>('takes').toArray();
+        const sessionRows = await tx
+          .table<{ id: string; roomNo: string }>('sessions')
+          .toArray();
+        const takeById = new Map(takeRows.map((item) => [item.id, item]));
+        const roomBySession = new Map(sessionRows.map((item) => [item.id, item.roomNo]));
+        await tx
+          .table('picks')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.basis !== 'string' || row.basis.length === 0) {
+              const take = typeof row.takeId === 'string' ? takeById.get(row.takeId) : undefined;
+              const roomNo = take ? roomBySession.get(take.sessionId) ?? '' : '';
+              row.basis = take ? pickBasisSignature({ startTc: take.startTc, endTc: take.endTc, roomNo }) : '';
+            }
+            // 历史优选一律进待复核区；仅当已带合法确认状态（来自更新版本）时尊重原值
+            row.confirmState = row.confirmState === '已确认' || row.confirmState === '待复核' ? row.confirmState : '待复核';
+          });
       });
   }
 }
@@ -82,6 +137,15 @@ export async function initDatabase(): Promise<void> {
   if ((await db.projects.count()) === 0) {
     await seedDatabase(db);
   }
+}
+
+/** 计算优选当前应有的确认基准（Take 时间码 + 场次棚号）；条次 / 场次缺失返回 null */
+export async function computePickBasis(takeId: string): Promise<string | null> {
+  const take = await db.takes.get(takeId);
+  if (!take) return null;
+  const session = await db.sessions.get(take.sessionId);
+  if (!session) return null;
+  return pickBasisSignature({ startTc: take.startTc, endTc: take.endTc, roomNo: session.roomNo });
 }
 
 /* ------------------------------ 项目 ------------------------------ */
@@ -155,11 +219,58 @@ export async function listSessions(): Promise<SessionRow[]> {
 }
 
 export async function putSession(row: SessionRow): Promise<void> {
-  await db.sessions.put(row);
+  await db.transaction('rw', [db.sessions], async () => {
+    const conflict = await findRoomConflict(row.roomNo, row.date, row.period, null);
+    if (conflict) {
+      throw new Error(`${row.roomNo} 在 ${row.date} ${row.period} 已被场次占用（场次 ${conflict.id}），请换棚或换时段`);
+    }
+    await db.sessions.put(row);
+  });
 }
 
-export async function updateSession(id: string, patch: Partial<Session>): Promise<void> {
-  await db.sessions.update(id, { ...patch, updatedAt: Date.now() } as never);
+/**
+ * 修订保存场次（乐观锁）。
+ * - 保存前比对已读 baseRevision，落后抛 RevisionConflictError，不写入
+ * - 棚号变更时，该场次下全部优选立即失效（转待复核），确认前不进入剪接清单
+ */
+export async function saveSessionRevisioned(
+  id: string,
+  patch: Partial<Session>,
+  baseRevision: number
+): Promise<SaveOutcome> {
+  return db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+    const current = await db.sessions.get(id);
+    if (!current) throw new Error('场次不存在或已被删除');
+    if (current.revision !== baseRevision) throw new RevisionConflictError(current);
+
+    const nextRoomNo = patch.roomNo ?? current.roomNo;
+    const nextDate = patch.date ?? current.date;
+    const nextPeriod = patch.period ?? current.period;
+    const conflict = await findRoomConflict(nextRoomNo, nextDate, nextPeriod, id);
+    if (conflict) {
+      throw new Error(`${nextRoomNo} 在 ${nextDate} ${nextPeriod} 已被场次占用（场次 ${conflict.id}），请换棚或换时段`);
+    }
+
+    const roomChanged = patch.roomNo !== undefined && patch.roomNo !== current.roomNo;
+    const now = Date.now();
+    await db.sessions.update(id, { ...patch, revision: current.revision + 1, updatedAt: now } as never);
+
+    let invalidatedPicks = 0;
+    if (roomChanged) {
+      const affected = await db.picks
+        .where('takeId')
+        .anyOf(await db.takes.where('sessionId').equals(id).primaryKeys())
+        .toArray();
+      if (affected.length > 0) {
+        await db.picks
+          .where('takeId')
+          .anyOf(affected.map((item) => item.takeId))
+          .modify({ confirmState: '待复核', updatedAt: now } as never);
+        invalidatedPicks = affected.length;
+      }
+    }
+    return { invalidatedPicks };
+  });
 }
 
 /**
@@ -203,16 +314,56 @@ export async function putTake(row: TakeRow): Promise<void> {
   await db.takes.put(row);
 }
 
-export async function updateTake(id: string, patch: Partial<Take>): Promise<void> {
-  await db.takes.update(id, { ...patch, updatedAt: Date.now() } as never);
+/**
+ * 修订保存 Take（乐观锁）。
+ * - 保存前比对已读 baseRevision，落后抛 RevisionConflictError，不写入
+ * - 起止时间码变动（或转移场次导致棚号变化）时，该 Take 的优选立即失效转待复核
+ */
+export async function saveTakeRevisioned(
+  id: string,
+  patch: Partial<Take>,
+  baseRevision: number
+): Promise<SaveOutcome> {
+  return db.transaction('rw', [db.takes, db.sessions, db.picks], async () => {
+    const current = await db.takes.get(id);
+    if (!current) throw new Error('条次不存在或已被删除');
+    if (current.revision !== baseRevision) throw new RevisionConflictError(current);
+
+    const timeChanged =
+      (patch.startTc !== undefined && patch.startTc !== current.startTc) ||
+      (patch.endTc !== undefined && patch.endTc !== current.endTc) ||
+      (patch.sessionId !== undefined && patch.sessionId !== current.sessionId);
+
+    const now = Date.now();
+    await db.takes.update(id, { ...patch, revision: current.revision + 1, updatedAt: now } as never);
+
+    let invalidatedPicks = 0;
+    if (timeChanged) {
+      const affected = await db.picks.where('takeId').equals(id).toArray();
+      if (affected.length > 0) {
+        await db.picks
+          .where('takeId')
+          .equals(id)
+          .modify({ confirmState: '待复核', updatedAt: now } as never);
+        invalidatedPicks = affected.length;
+      }
+    }
+    return { invalidatedPicks };
+  });
 }
 
-/** 批量改评级 */
+/** 批量改评级（同步推进编辑版本，避免后续保存基于过期版本） */
 export async function bulkUpdateGrade(ids: string[], grade: Take['grade']): Promise<void> {
   await db.transaction('rw', [db.takes], async () => {
-    for (const id of ids) {
-      await db.takes.update(id, { grade, updatedAt: Date.now() } as never);
-    }
+    const now = Date.now();
+    await db.takes
+      .where('id')
+      .anyOf(ids)
+      .modify((row: TakeRow) => {
+        row.grade = grade;
+        row.revision += 1;
+        row.updatedAt = now;
+      });
   });
 }
 
@@ -234,15 +385,72 @@ export async function putPick(row: PickRow): Promise<void> {
   await db.picks.put(row);
 }
 
-export async function updatePick(id: string, patch: Partial<Pick>): Promise<void> {
-  await db.picks.update(id, { ...patch, updatedAt: Date.now() } as never);
+/**
+ * 修订保存优选（乐观锁）。保存前比对已读 baseRevision，落后抛 RevisionConflictError。
+ * 重新指定被优选 Take 时，以新 Take 的当前时间码 / 棚号为确认基准，直接作为已确认生效。
+ */
+export async function savePickRevisioned(
+  id: string,
+  patch: Partial<Omit<Pick, 'confirmState' | 'basis'>>,
+  baseRevision: number
+): Promise<void> {
+  await db.transaction('rw', [db.picks, db.takes, db.sessions], async () => {
+    const current = await db.picks.get(id);
+    if (!current) throw new Error('优选记录不存在或已被删除');
+    if (current.revision !== baseRevision) throw new RevisionConflictError(current);
+
+    const now = Date.now();
+    if (patch.takeId !== undefined && patch.takeId !== current.takeId) {
+      const basis = await computePickBasis(patch.takeId);
+      if (!basis) throw new Error('所选条次不存在或其场次已删除，无法优选');
+      await db.picks.update(id, {
+        ...patch,
+        confirmState: '已确认' satisfies PickConfirmState,
+        basis,
+        revision: current.revision + 1,
+        updatedAt: now
+      } as never);
+      return;
+    }
+    await db.picks.update(id, { ...patch, revision: current.revision + 1, updatedAt: now } as never);
+  });
 }
 
-/** 拖拽 / 上下移后按新顺序批量写回 */
+/**
+ * 复核确认优选（乐观锁）：按当前 Take 时间码 / 棚号重算确认基准并置为已确认。
+ * 已读版本落后抛 RevisionConflictError，不写入。确认后才进入剪接清单。
+ */
+export async function confirmPickRevisioned(id: string, baseRevision: number): Promise<void> {
+  await db.transaction('rw', [db.picks, db.takes, db.sessions], async () => {
+    const current = await db.picks.get(id);
+    if (!current) throw new Error('优选记录不存在或已被删除');
+    if (current.revision !== baseRevision) throw new RevisionConflictError(current);
+    const basis = await computePickBasis(current.takeId);
+    if (!basis) throw new Error('条次或场次已删除，无法确认优选');
+    const now = Date.now();
+    await db.picks.update(id, {
+      confirmState: '已确认' satisfies PickConfirmState,
+      basis,
+      revision: current.revision + 1,
+      updatedAt: now
+    } as never);
+  });
+}
+
+/** 拖拽 / 上下移后按新顺序批量写回（同步推进编辑版本） */
 export async function reorderPicks(orderedIds: string[]): Promise<void> {
   await db.transaction('rw', [db.picks], async () => {
+    const rows = await db.picks.where('id').anyOf(orderedIds).toArray();
+    const revisionById = new Map(rows.map((row) => [row.id, row.revision]));
+    const now = Date.now();
     for (let index = 0; index < orderedIds.length; index += 1) {
-      await db.picks.update(orderedIds[index], { order: index + 1, updatedAt: Date.now() } as never);
+      const baseRevision = revisionById.get(orderedIds[index]);
+      if (baseRevision === undefined) continue;
+      await db.picks.update(orderedIds[index], {
+        order: index + 1,
+        revision: baseRevision + 1,
+        updatedAt: now
+      } as never);
     }
   });
 }
@@ -292,6 +500,9 @@ export async function removeRetake(id: string): Promise<void> {
 
 /* --------------------------- 整库导入导出 --------------------------- */
 
+/** 备份中的优选：旧版本备份可能没有确认状态 / 确认基准字段 */
+export type SnapshotPick = Omit<Pick, 'confirmState' | 'basis'> & Partial<Pick>;
+
 export interface DatabaseSnapshot {
   name: string;
   schemaVersion: number;
@@ -300,7 +511,7 @@ export interface DatabaseSnapshot {
   songs: Song[];
   sessions: Session[];
   takes: Take[];
-  picks: Pick[];
+  picks: SnapshotPick[];
   retakes: Retake[];
 }
 
@@ -329,7 +540,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     songs: songs.map(stripRow),
     sessions: sessions.map(stripRow),
     takes: takes.map(stripRow),
-    picks: picks.map(stripRow),
+    picks: picks.map(stripRow) as SnapshotPick[],
     retakes: retakes.map(stripRow)
   };
 }
@@ -340,6 +551,9 @@ function stamp<T>(row: T): T & Revisioned {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  const takeById = new Map(snapshot.takes.map((item) => [item.id, item]));
+  const roomBySession = new Map(snapshot.sessions.map((item) => [item.id, item.roomNo]));
+
   await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
     await Promise.all([
       db.projects.clear(),
@@ -353,7 +567,22 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.songs.bulkPut(snapshot.songs.map(stamp));
     await db.sessions.bulkPut(snapshot.sessions.map(stamp));
     await db.takes.bulkPut(snapshot.takes.map(stamp));
-    await db.picks.bulkPut(snapshot.picks.map(stamp));
+    // 旧备份优选缺少确认状态：补基准并进待复核区，与结构升级保持一致
+    const stampedPicks: PickRow[] = snapshot.picks.map((raw) => {
+      const base = stamp(raw);
+      const take = takeById.get(raw.takeId);
+      const roomNo = take ? roomBySession.get(take.sessionId) ?? '' : '';
+      const fallbackBasis = take
+        ? pickBasisSignature({ startTc: take.startTc, endTc: take.endTc, roomNo })
+        : '';
+      const confirmState: PickConfirmState = raw.confirmState === '已确认' ? '已确认' : '待复核';
+      return {
+        ...base,
+        confirmState,
+        basis: typeof raw.basis === 'string' && raw.basis.length > 0 ? raw.basis : fallbackBasis
+      };
+    });
+    await db.picks.bulkPut(stampedPicks);
     await db.retakes.bulkPut(snapshot.retakes.map(stamp));
   });
 }

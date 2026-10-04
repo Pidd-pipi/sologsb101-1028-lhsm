@@ -91,23 +91,26 @@ sologsb101-1028/
         ├── main.tsx  App.tsx  vite-env.d.ts
         ├── types/              # project.ts song.ts session.ts take.ts pick.ts retake.ts filter.ts
         ├── stores/             # projectStore sessionStore takeStore pickStore
-        ├── components/common/  # TakeBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/common/  # TakeBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx RevisionConflictAlert.tsx
         ├── hooks/              # useTakeFilter.ts useIdbTable.ts
-        ├── utils/              # timecode.ts db.ts export.ts seed.ts uuid.ts
+        ├── utils/              # timecode.ts db.ts export.ts seed.ts uuid.ts pickBasis.ts
         ├── pages/              # ProjectList SessionPlan TakeBoard PickSummary RetakePlan
         ├── styles/main.css
         ├── router/index.tsx    # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts    # 叶子模块：路径常量与导航配置，切断 App ⇄ router 循环依赖
-        └── utils/revision.ts   # 叶子模块：行修订号，切断 utils/db ⇄ utils/seed 循环依赖
+        └── utils/revision.ts   # 叶子模块：行初始修订号，切断 utils/db ⇄ utils/seed 循环依赖
 ```
 
 ---
 
 ## 六、数据存储说明
 
-- **IndexedDB 库名**：`gbstudiotake-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
+- **IndexedDB 库名**：`gbstudiotake-db`（Dexie 封装），结构版本号 `version(2)`，并带 `upgrade()` 迁移逻辑（v1 → v2：为历史行补齐行修订号与时间戳，为优选补确认状态与确认基准，旧优选全部进入待复核区）。
 - **分表存储**：`projects` 项目、`songs` 曲目、`sessions` 场次、`takes` 条次、`picks` 优选、`retakes` 补录，共 6 张表；每行带 `revision` / `createdAt` / `updatedAt`。
+- **多标签并发（乐观锁修订保存）**：场次、Take、优选保存前比对打开弹窗时读到的 `revision`；若已被其他标签页改过（版本落后），保存被拒绝且不写入，弹窗保留你的输入并逐字段并列库内最新值，可逐字段或一键采用最新值后再保存。
+- **优选失效与复核**：Take 起止时间码（含转移场次）或场次棚号一旦修改，关联优选**立即**转入「待复核」并保留旧确认基准；待复核条目不进入剪接清单，需在优选页核对当前时间码 / 棚号后确认，确认时重算基准并回到剪接清单。
 - **首屏自动播种**：`utils/db.ts` 的 `initDatabase()` 在 `projects` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录），保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
 - **时间码规则**：格式 `HH:MM:SS:FF`，帧率 25 帧；`utils/timecode.ts` 提供互转、时长汇总、重叠检测与 Take 号自动递增。
-- **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。
+- **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。多标签共享同一个浏览器本地库，Dexie 的 liveQuery 会自动跨标签刷新。
+- **旧备份导入**：导入 v1 备份（无确认状态字段）时与结构升级一致——为优选补确认基准并置为待复核，人工确认后才进入剪接清单。
 - **级联规则**：删除项目级联删除其曲目、场次、Take、优选与补录；删除场次级联删除其 Take 与对应优选。
