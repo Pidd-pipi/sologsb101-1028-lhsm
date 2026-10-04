@@ -12,6 +12,7 @@ export const ROUTES = {
   sessions: '/sessions',
   takes: '/takes',
   picks: '/picks',
+  review: '/review',
   retakes: '/retakes'
 } as const;
 
@@ -30,5 +31,6 @@ export const NAV_ITEMS: NavItem[] = [
   { path: ROUTES.sessions, label: '场次排期', icon: '🗓️', hint: '棚号与乐手安排' },
   { path: ROUTES.takes, label: 'Take 标记台', icon: '⏱️', hint: '时间码与评级' },
   { path: ROUTES.picks, label: '优选与剪接', icon: '✂️', hint: '剪接清单汇总' },
+  { path: ROUTES.review, label: '修订复核区', icon: '🧾', hint: '并发冲突与失效重算' },
   { path: ROUTES.retakes, label: '补录计划', icon: '🔁', hint: '补录与记录表导出' }
 ];

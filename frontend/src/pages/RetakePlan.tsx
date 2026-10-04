@@ -183,7 +183,8 @@ export default function RetakePlan() {
         <div>
           <h2 className="page__title">补录计划与结构版本导出</h2>
           <p className="page__subtitle">
-            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 补录完成后自动联动曲目录制状态。
+            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}：场次 / Take / 优选修订保存 + 复核区）·
+            补录完成后自动联动曲目录制状态。
           </p>
         </div>
         <Space>

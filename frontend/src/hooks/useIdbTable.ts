@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from 'react';
 import { liveQuery, type Table } from 'dexie';
 import { ROW_REVISION } from '@/utils/db';
 import { createId } from '@/utils/uuid';
+import type { ReviewState } from '@/types/revision';
 
 export interface IdbRecord {
   id: string;
@@ -47,21 +48,29 @@ export function useIdbTable<T extends IdbRecord>(
   return rows;
 }
 
-/** 带 id / 修订号 / 时间戳的持久化行 */
+/** 带 id / 修订号 / 时间戳 / 乐观锁版本的持久化行 */
 export interface StampedRow {
   id: string;
   revision: number;
+  /** 编辑版本号（乐观锁）：新建行从 v1 开始 */
+  editVersion: number;
+  /** 复核状态：新建数据默认已确认；优选新建改由 db.insertPick 固化来源快照 */
+  reviewState: ReviewState;
+  reviewReason: string;
   createdAt: number;
   updatedAt: number;
 }
 
-/** 组装一行带 id / 修订号 / 时间戳的持久化记录 */
+/** 组装一行带 id / 修订号 / 乐观锁版本 / 时间戳的持久化记录 */
 export function buildRow<T extends object>(payload: T, prefix: string): T & StampedRow {
   const now = Date.now();
   return {
     ...payload,
     id: createId(prefix),
     revision: ROW_REVISION,
+    editVersion: 1,
+    reviewState: '已确认',
+    reviewReason: '',
     createdAt: now,
     updatedAt: now
   } as T & StampedRow;

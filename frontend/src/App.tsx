@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Badge, Layout, Menu, Space, Tag, Typography, message } from 'antd';
 import {
+  AuditOutlined,
   AudioOutlined,
   ClockCircleOutlined,
   FolderOpenOutlined,
@@ -23,6 +24,7 @@ const MENU_ICONS: Record<string, JSX.Element> = {
   [ROUTES.sessions]: <ClockCircleOutlined />,
   [ROUTES.takes]: <AudioOutlined />,
   [ROUTES.picks]: <ScissorOutlined />,
+  [ROUTES.review]: <AuditOutlined />,
   [ROUTES.retakes]: <ReloadOutlined />
 };
 

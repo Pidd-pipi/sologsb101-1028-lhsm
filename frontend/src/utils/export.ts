@@ -52,13 +52,32 @@ export interface SessionSheet {
   };
 }
 
-type WithRevision = { revision?: number; createdAt?: number; updatedAt?: number };
+type WithRevision = {
+  revision?: number;
+  createdAt?: number;
+  updatedAt?: number;
+  editVersion?: number;
+  reviewState?: unknown;
+  reviewReason?: string;
+  srcStartTc?: string;
+  srcEndTc?: string;
+  srcRoomNo?: string;
+  srcSessionId?: string;
+};
 
+/** 导出 / 记录表只保留业务字段，行修订号、乐观锁版本、复核区与优选快照均不导出 */
 function stripRevision<T extends WithRevision>(row: T): T {
   const copy = { ...row } as Record<string, unknown>;
   delete copy.revision;
   delete copy.createdAt;
   delete copy.updatedAt;
+  delete copy.editVersion;
+  delete copy.reviewState;
+  delete copy.reviewReason;
+  delete copy.srcStartTc;
+  delete copy.srcEndTc;
+  delete copy.srcRoomNo;
+  delete copy.srcSessionId;
   return copy as T;
 }
 
@@ -88,7 +107,8 @@ export async function buildSessionSheet(): Promise<SessionSheet> {
       projectName: project ? project.name : '项目已删除',
       takeCount: own.length,
       usableCount: own.filter((item) => item.grade === '可用').length,
-      pickedCount: picks.filter((item) => ownIds.includes(item.takeId)).length,
+      // 仅统计已确认优选：失效待复核的优选在确认前不进入剪接清单
+      pickedCount: picks.filter((item) => ownIds.includes(item.takeId) && item.reviewState === '已确认').length,
       durationText: formatDuration(totalDuration(own))
     };
   });
@@ -112,7 +132,7 @@ export async function buildSessionSheet(): Promise<SessionSheet> {
       takeCount: takes.length,
       usableTakeCount: usable,
       usableRatio: takes.length > 0 ? Math.round((usable / takes.length) * 100) : 0,
-      pickedCount: picks.length,
+      pickedCount: picks.filter((item) => item.reviewState === '已确认').length,
       openRetakeCount: retakes.filter((item) => item.state !== '已完成').length,
       totalDurationText: formatDuration(totalDuration(takes)),
       rows

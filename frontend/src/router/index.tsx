@@ -15,6 +15,7 @@ const ProjectList = lazy(() => import('@/pages/ProjectList'));
 const SessionPlan = lazy(() => import('@/pages/SessionPlan'));
 const TakeBoard = lazy(() => import('@/pages/TakeBoard'));
 const PickSummary = lazy(() => import('@/pages/PickSummary'));
+const ReviewBoard = lazy(() => import('@/pages/ReviewBoard'));
 const RetakePlan = lazy(() => import('@/pages/RetakePlan'));
 
 /** 兼容出口：路径常量与导航配置请优先直接从 './routes' 引入（叶子模块，不产生环） */
@@ -45,6 +46,7 @@ export const router = createBrowserRouter([
       { path: 'sessions', element: withSuspense(<SessionPlan />) },
       { path: 'takes', element: withSuspense(<TakeBoard />) },
       { path: 'picks', element: withSuspense(<PickSummary />) },
+      { path: 'review', element: withSuspense(<ReviewBoard />) },
       { path: 'retakes', element: withSuspense(<RetakePlan />) },
       { path: '*', element: <Navigate to={ROUTES.projects} replace /> }
     ]

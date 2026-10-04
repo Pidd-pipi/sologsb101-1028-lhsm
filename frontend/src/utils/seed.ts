@@ -18,9 +18,29 @@ import type {
 } from './db';
 import { ROW_REVISION } from './revision';
 
-function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
+/** 演示数据是「当前数据」而非历史升级数据：带乐观锁 v1 且默认已确认，原页面打开即可用 */
+function rev<T>(row: T): T & {
+  revision: number;
+  editVersion: number;
+  reviewState: '已确认';
+  reviewReason: '';
+  srcStartTc?: string;
+  srcEndTc?: string;
+  srcRoomNo?: string;
+  srcSessionId?: string;
+  createdAt: number;
+  updatedAt: number;
+} {
   const now = Date.now();
-  return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
+  return {
+    ...row,
+    revision: ROW_REVISION,
+    editVersion: 1,
+    reviewState: '已确认',
+    reviewReason: '',
+    createdAt: now,
+    updatedAt: now
+  };
 }
 
 const PROJECTS: Array<Omit<ProjectRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
@@ -36,14 +56,18 @@ const SONGS: Array<Omit<SongRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
   { id: 'sg-004', projectId: 'prj-003', title: '蓝岸 30s', durationSec: 30, arrangement: '合唱', state: '已完成' }
 ];
 
-const SESSIONS: Array<Omit<SessionRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const SESSIONS: Array<
+  Omit<SessionRow, 'revision' | 'createdAt' | 'updatedAt' | 'editVersion' | 'reviewState' | 'reviewReason'>
+> = [
   { id: 'ss-001', songId: 'sg-001', date: '2024-03-12', period: '上午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '鼓：许峰、贝斯：黎川、吉他：程野', state: '已完成' },
   { id: 'ss-002', songId: 'sg-001', date: '2024-03-13', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '弦乐四重奏', state: '已完成' },
   { id: 'ss-003', songId: 'sg-002', date: '2024-03-20', period: '晚上', engineer: '何笙', roomNo: 'B 棚', musicians: '大提琴：闻州', state: '已排期' },
   { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成' }
 ];
 
-const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const TAKES: Array<
+  Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt' | 'editVersion' | 'reviewState' | 'reviewReason'>
+> = [
   { id: 'tk-001', sessionId: 'ss-001', takeNo: 'T01', startTc: '00:00:12:00', endTc: '00:04:05:00', grade: '可用', issues: ['无'] },
   { id: 'tk-002', sessionId: 'ss-001', takeNo: 'T02', startTc: '00:04:20:00', endTc: '00:08:10:00', grade: '废', issues: ['音准', '节奏'] },
   { id: 'tk-003', sessionId: 'ss-001', takeNo: 'T03', startTc: '00:08:30:00', endTc: '00:12:40:00', grade: '待定', issues: ['噪声'] },
@@ -52,7 +76,7 @@ const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
   { id: 'tk-006', sessionId: 'ss-004', takeNo: 'T01', startTc: '00:00:08:00', endTc: '00:03:45:00', grade: '可用', issues: ['无'] }
 ];
 
-const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt' | 'editVersion' | 'reviewState' | 'reviewReason' | 'srcStartTc' | 'srcEndTc' | 'srcRoomNo' | 'srcSessionId'>> = [
   { id: 'pk-001', takeId: 'tk-001', usage: '主歌', order: 1, note: '第 1 段最稳，鼓组干净' },
   { id: 'pk-002', takeId: 'tk-004', usage: '副歌', order: 2, note: '弦乐起弓整齐' },
   { id: 'pk-003', takeId: 'tk-006', usage: '全曲', order: 3, note: '钢琴整轨留作参考' }
@@ -73,7 +97,19 @@ export async function seedDatabase(target: GbStudioTakeDatabase): Promise<void> 
       await target.songs.bulkPut(SONGS.map(rev));
       await target.sessions.bulkPut(SESSIONS.map(rev));
       await target.takes.bulkPut(TAKES.map(rev));
-      await target.picks.bulkPut(PICKS.map(rev));
+      // 优选水合来源快照（Take 时间码 + 所属场次棚号），与正式新建优选保持一致
+      const stampedPicks = PICKS.map((pick) => {
+        const take = TAKES.find((item) => item.id === pick.takeId);
+        const session = take ? SESSIONS.find((item) => item.id === take.sessionId) : undefined;
+        return rev({
+          ...pick,
+          srcStartTc: take?.startTc ?? '',
+          srcEndTc: take?.endTc ?? '',
+          srcRoomNo: session?.roomNo ?? '',
+          srcSessionId: take?.sessionId ?? ''
+        });
+      });
+      await target.picks.bulkPut(stampedPicks);
       await target.retakes.bulkPut(RETAKES.map(rev));
     }
   );

@@ -117,7 +117,7 @@ export default function ProjectList() {
     return {
       songCount: ownSongs.length,
       sessionCount: ownSessions.length,
-      pickedTakeCount: picks.filter((pick) => takeIds.includes(pick.takeId)).length,
+      pickedTakeCount: picks.filter((pick) => takeIds.includes(pick.takeId) && pick.reviewState === '已确认').length,
       availableTakeCount: ownTakes.filter((take) => take.grade === '可用').length
     };
   };

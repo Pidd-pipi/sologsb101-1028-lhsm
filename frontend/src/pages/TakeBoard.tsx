@@ -13,6 +13,7 @@ import {
   Select,
   Space,
   Table,
+  Tag,
   Tooltip,
   message
 } from 'antd';
@@ -22,11 +23,16 @@ import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import TakeBadge from '@/components/common/TakeBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import ReviewStateTag from '@/components/common/ReviewStateTag';
+import RevisionConflictAlert from '@/components/common/RevisionConflictAlert';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useTakeFilter } from '@/hooks/useTakeFilter';
 import { useTakeStore } from '@/stores/takeStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import { isRevisionConflict, type RevisionConflictError } from '@/utils/concurrency';
+import { ROUTES } from '@/router/routes';
+import { Link } from 'react-router-dom';
 import { TAKE_GRADES, TAKE_ISSUES, createEmptyTake, type Take, type TakeGrade } from '@/types/take';
 import type { FilterSelectConfig } from '@/types/filter';
 import {
@@ -55,6 +61,7 @@ export default function TakeBoard() {
   const setSelected = useTakeStore((state) => state.setSelected);
   const createTake = useTakeStore((state) => state.createTake);
   const editTake = useTakeStore((state) => state.editTake);
+  const confirmTake = useTakeStore((state) => state.confirmTake);
   const deleteTake = useTakeStore((state) => state.deleteTake);
   const batchGrade = useTakeStore((state) => state.batchGrade);
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
@@ -62,6 +69,8 @@ export default function TakeBoard() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<TakeRow | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 修订保存冲突：保留输入并列差异，未解决前不能写新版本 */
+  const [conflict, setConflict] = useState<RevisionConflictError | null>(null);
   const [form] = Form.useForm<Omit<Take, 'id'>>();
 
   useEffect(() => {
@@ -129,6 +138,12 @@ export default function TakeBoard() {
     };
   }, [scoped]);
 
+  /** 待复核 Take 数（旧数据升级或时间码 / 棚号被其他标签页改动） */
+  const pendingReviewCount = useMemo(
+    () => takes.filter((take) => take.reviewState === '待复核').length,
+    [takes]
+  );
+
   const columns: ColumnsType<TakeRow> = [
     {
       title: '场次',
@@ -151,6 +166,32 @@ export default function TakeBoard() {
       render: (_, row) => <TakeBadge grade={row.grade} issues={row.issues} />
     },
     {
+      title: '复核',
+      width: 130,
+      render: (_, row) =>
+        row.reviewState === '待复核' ? (
+          <Space size={4}>
+            <ReviewStateTag state={row.reviewState} reason={row.reviewReason} />
+            <Button
+              type="link"
+              size="small"
+              onClick={async () => {
+                try {
+                  await confirmTake(row.id, row.editVersion);
+                  message.success('Take 已确认');
+                } catch (confirmError) {
+                  message.error(confirmError instanceof Error ? confirmError.message : '确认失败，请刷新后重试');
+                }
+              }}
+            >
+              确认
+            </Button>
+          </Space>
+        ) : (
+          <ReviewStateTag state={row.reviewState} />
+        )
+    },
+    {
       title: '操作',
       width: 150,
       render: (_, row) => (
@@ -161,6 +202,7 @@ export default function TakeBoard() {
             onClick={() => {
               setEditing(row);
               setError(null);
+              setConflict(null);
               form.setFieldsValue({
                 sessionId: row.sessionId,
                 takeNo: row.takeNo,
@@ -210,19 +252,55 @@ export default function TakeBoard() {
     const siblings = takes.filter((take) => take.sessionId === values.sessionId && take.id !== editing?.id);
     const clash = siblings.find((take) => isOverlapping(values.startTc, values.endTc, take.startTc, take.endTc));
     setError(null);
-    if (editing) {
-      await editTake(editing.id, values);
-      message.success('条次已更新');
-    } else {
-      await createTake(values);
-      message.success('条次已标记');
+    try {
+      if (editing) {
+        const result = await editTake(editing.id, values, editing);
+        message.success('条次已更新');
+        if (result.invalidatedPicks > 0) {
+          message.warning(`时间码或棚号变化已使 ${result.invalidatedPicks} 条优选失效，重算确认后才会重新进入剪接清单`);
+        }
+      } else {
+        await createTake(values);
+        message.success('条次已标记');
+      }
+    } catch (submitError) {
+      if (isRevisionConflict(submitError)) {
+        // 已读版本落后：保留弹窗与用户输入，并列冲突，不写新版本
+        setConflict(submitError);
+        message.error(submitError.message);
+        return;
+      }
+      const text = submitError instanceof Error ? submitError.message : '保存失败';
+      setError(text);
+      message.error(text);
+      return;
     }
     if (clash) {
       message.warning(`注意：与同场次 ${clash.takeNo}（${clash.startTc} → ${clash.endTc}）时间码重叠`);
     }
     setDialogOpen(false);
     setEditing(null);
+    setConflict(null);
     form.resetFields();
+  }
+
+  /** 冲突后载入数据库最新行回填表单（已读版本同步到最新，可在最新基础上重做修改） */
+  function loadLatestIntoForm(conflictRowId: string): void {
+    const latest = takes.find((item) => item.id === conflictRowId);
+    if (!latest) {
+      message.warning('最新数据尚未同步到本页，请稍后再试');
+      return;
+    }
+    setEditing(latest);
+    form.setFieldsValue({
+      sessionId: latest.sessionId,
+      takeNo: latest.takeNo,
+      startTc: latest.startTc,
+      endTc: latest.endTc,
+      grade: latest.grade,
+      issues: latest.issues
+    });
+    setConflict(null);
   }
 
   /** 打开新增弹窗时自动递增 Take 号 */
@@ -231,6 +309,7 @@ export default function TakeBoard() {
     const siblings = takes.filter((take) => take.sessionId === targetSessionId);
     setEditing(null);
     setError(null);
+    setConflict(null);
     form.setFieldsValue({
       ...createEmptyTake(),
       sessionId: targetSessionId,
@@ -262,6 +341,24 @@ export default function TakeBoard() {
         <StatBadge label="有问题的条次" value={totals.issueCount} suffix="条" tone="danger" icon="warning" />
         <StatBadge label="合计时长" value={totals.durationText} tone="default" icon="trend" />
       </div>
+
+      {pendingReviewCount > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`${pendingReviewCount} 条 Take 待复核（旧数据升级或时间码 / 棚号被其他标签页改动）`}
+          description={
+            <span>
+              请先到
+              <Link to={ROUTES.review} style={{ marginInline: 4 }}>
+                修订复核区
+              </Link>
+              确认；受影响的优选在确认前不会进入剪接清单。
+            </span>
+          }
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filters}
@@ -337,7 +434,17 @@ export default function TakeBoard() {
 
       <Modal
         open={dialogOpen}
-        title={editing ? '编辑条次' : '标记 Take'}
+        title={
+          editing ? (
+            <Space>
+              <span>编辑条次</span>
+              <Tag>已读版本 v{editing.editVersion}</Tag>
+              {editing.reviewState === '待复核' ? <Tag color="gold">待复核</Tag> : null}
+            </Space>
+          ) : (
+            '标记 Take'
+          )
+        }
         onCancel={() => setDialogOpen(false)}
         onOk={submit}
         okText="保存"
@@ -345,6 +452,14 @@ export default function TakeBoard() {
         destroyOnClose
       >
         {error ? <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} /> : null}
+        {conflict ? (
+          <RevisionConflictAlert
+            latestVersion={conflict.latestVersion}
+            fields={conflict.fields}
+            idLabels={Object.fromEntries(sessions.map((session) => [session.id, sessionLabel(session.id)]))}
+            onLoadLatest={() => loadLatestIntoForm(conflict.rowId)}
+          />
+        ) : null}
         <Form form={form} layout="vertical">
           <Form.Item name="sessionId" label="场次" rules={[{ required: true, message: '请选择场次' }]}>
             <Select

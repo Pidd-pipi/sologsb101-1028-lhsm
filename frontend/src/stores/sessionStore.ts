@@ -1,10 +1,18 @@
 /**
  * 场次 store：维护场次排期、棚号占用校验与筛选条件。
+ * 编辑走修订保存（editVersion 乐观锁），棚号变化级联失效受影响优选。
  */
 import { create } from 'zustand';
 import type { FilterModel } from '@/types/filter';
 import type { Session } from '@/types/session';
-import { findRoomConflict, putSession, removeSession, updateSession } from '@/utils/db';
+import {
+  confirmSessionRevision,
+  findRoomConflict,
+  putSession,
+  removeSession,
+  saveSessionRevision,
+  type SessionRow
+} from '@/utils/db';
 import { buildRow } from '@/hooks/useIdbTable';
 
 export const SESSION_FILTER_KEYS = ['rooms', 'periods', 'states'];
@@ -16,7 +24,14 @@ interface SessionState {
   resetFilters: () => void;
   selectSession: (id: string | null) => void;
   createSession: (payload: Omit<Session, 'id'>) => Promise<string>;
-  editSession: (id: string, patch: Partial<Session>) => Promise<void>;
+  /**
+   * 修订保存场次。
+   * @param base 打开编辑框时读到的整行（携带已读 editVersion）
+   * @returns 级联失效的优选条数
+   */
+  editSession: (id: string, values: Omit<Session, 'id'>, base: SessionRow) => Promise<{ invalidatedPicks: number }>;
+  /** 复核确认场次 */
+  confirmSession: (id: string, baseVersion: number) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   assertRoomFree: (roomNo: string, date: string, period: string, selfId: string | null) => Promise<void>;
 }
@@ -40,12 +55,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ currentSessionId: row.id });
     return row.id;
   },
-  editSession: async (id, patch) => {
-    const current = { ...patch } as Partial<Session>;
-    if (patch.roomNo && patch.date && patch.period) {
-      await get().assertRoomFree(patch.roomNo, patch.date, patch.period, id);
+  editSession: async (id, values, base) => {
+    if (values.roomNo && values.date && values.period) {
+      await get().assertRoomFree(values.roomNo, values.date, values.period, id);
     }
-    await updateSession(id, current);
+    return saveSessionRevision(id, values, base);
+  },
+  confirmSession: async (id, baseVersion) => {
+    await confirmSessionRevision(id, baseVersion);
   },
   deleteSession: async (id) => {
     await removeSession(id);

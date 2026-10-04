@@ -1,10 +1,18 @@
 /**
  * Take store：维护条次列表的评级 / 问题标签 / 时间码筛选，以及批量改评级。
+ * 编辑走修订保存（editVersion 乐观锁），时间码或棚号变化级联失效受影响优选。
  */
 import { create } from 'zustand';
 import type { FilterModel } from '@/types/filter';
 import type { Take } from '@/types/take';
-import { bulkUpdateGrade, putTake, removeTake, updateTake } from '@/utils/db';
+import {
+  bulkUpdateGrade,
+  confirmTakeRevision,
+  putTake,
+  removeTake,
+  saveTakeRevision,
+  type TakeRow
+} from '@/utils/db';
 import { buildRow } from '@/hooks/useIdbTable';
 
 export const TAKE_FILTER_KEYS = ['grades', 'issues', 'sessionIds', 'minTc', 'maxTc'];
@@ -17,7 +25,14 @@ interface TakeState {
   toggleSelected: (id: string) => void;
   setSelected: (ids: string[]) => void;
   createTake: (payload: Omit<Take, 'id'>) => Promise<string>;
-  editTake: (id: string, patch: Partial<Take>) => Promise<void>;
+  /**
+   * 修订保存 Take。
+   * @param base 打开编辑框时读到的整行（携带已读 editVersion）
+   * @returns 级联失效的优选条数
+   */
+  editTake: (id: string, values: Omit<Take, 'id'>, base: TakeRow) => Promise<{ invalidatedPicks: number }>;
+  /** 复核确认 Take */
+  confirmTake: (id: string, baseVersion: number) => Promise<void>;
   deleteTake: (id: string) => Promise<void>;
   batchGrade: (ids: string[], grade: Take['grade']) => Promise<void>;
 }
@@ -40,8 +55,9 @@ export const useTakeStore = create<TakeState>()((set, get) => ({
     await putTake(row);
     return row.id;
   },
-  editTake: async (id, patch) => {
-    await updateTake(id, patch);
+  editTake: async (id, values, base) => saveTakeRevision(id, values, base),
+  confirmTake: async (id, baseVersion) => {
+    await confirmTakeRevision(id, baseVersion);
   },
   deleteTake: async (id) => {
     await removeTake(id);
